@@ -5,6 +5,17 @@ import glob
 import datetime
 import sys
 
+
+DB_PATH = "user_pass.json" #setting the json database for later calls
+
+try:
+    with open(DB_PATH, "r", encoding="utf-8") as f:
+        database = json.load(f)
+        if not isinstance(database, dict):
+            database = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    database = {}
+
 def server():
     serverPort = 13000
 
@@ -30,7 +41,8 @@ def server():
             username = data.decode('ascii').strip()
 
             # Validate username
-            if username != 'client1' or username != 'client2' or username != 'client3' or username != 'client4' or username != 'client5':
+            
+            if username not in database.json:
                 connectionSocket.send("Incorrect username. Connection terminated.\n".encode('ascii'))
                 connectionSocket.close()
                 continue
