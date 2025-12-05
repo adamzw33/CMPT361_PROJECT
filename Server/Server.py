@@ -10,8 +10,9 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
 PORT = 13000
-
-DB_PATH = "user_pass.json" #setting the json database for later calls
+DB_PATH = "user_pass.json" 
+AES_BLOCK = AES.block_size
+FRAME_LEN_BYTES = 8
 
 try:
     with open(DB_PATH, "r", encoding="utf-8") as f:
@@ -20,6 +21,26 @@ try:
             database = {}
 except (FileNotFoundError, json.JSONDecodeError):
     database = {}
+
+def recv_all(conn, n):
+    data = b""
+    while len(data) < n:
+        pkt = conn.recv(n - len(data))
+        if not pkt:
+            return None
+        data += pkt
+    return data
+
+def send_framed(conn, data_bytes):
+    ln = len(data_bytes)
+    conn.sendall(ln.to_bytes(FRAME_LEN_BYTES, "big") + data_bytes)
+
+def recv_framed(conn):
+    header = recv_all(conn, FRAME_LEN_BYTES)
+    if not header:
+        return None
+    ln = int.from_bytes(header, "big")
+    return recv_all(conn, ln)
 
 def load_keys():
     keys = {}
@@ -34,8 +55,18 @@ def load_keys():
     return keys
 
 def load_user_password():
-    with open("user_pass.json", "r") as f:
+    with open(DB_PATH, "r") as f:
         return json.load(f)
+
+def ensure_client_folder(username):
+    if not os.path.isdir(username):
+        os.mkdir(username)
+
+def encrypt_aes(aes, plaintext):
+    return aes.encrypt(pad(plaintext, AES_BLOCK))
+
+def decrypt_aes(aes, ciphertext):
+    return unpad(aes.decrypt(ciphertext), AES_BLOCK)
 
 def handle_client(conn, addr, keys, user_pass):
     private_cipher = PKCS1_OAEP.new(keys['server_private'])
@@ -54,8 +85,11 @@ def handle_client(conn, addr, keys, user_pass):
         return
     if username not in user_pass or user_pass[username] != password:
         conn.sendall(b"Invalid username or password.")
+        print("The receives client information:", username, "is invalid (Connection Terminated).")
         conn.close()
         return
+    
+    print("Connection Accepted and Symmetric key Generated for client:", username)
     
     client_pub = keys[f"{username}_public"]
     pub_cipher = PKCS1_OAEP.new(client_pub)
@@ -67,7 +101,12 @@ def handle_client(conn, addr, keys, user_pass):
 
     from Crypto.Cipher import AES
     aes = AES.new(sym_key, AES.MODE_ECB)
-    ok_msg = aes.decrypt(conn.recv(4096))
+    enc_ok = conn.recv(4096)
+    ok = unpad(aes.decrypt(enc_ok), 16)
+
+    if ok != b"OK":
+        conn.close()
+        return
 
     conn.close()
 
@@ -82,3 +121,16 @@ def main():
     except Exception as e:
         print("Server socket error:", e)
         sys.exit(1)
+    
+    keys = load_keys()
+    user_pass = load_user_password()
+
+    while True:
+        conn, addr = serverSocket.accept()
+        pid = os.fork()
+        if pid == 0:
+            serverSocket.close
+            handle_client(conn, addr, keys, user_pass)
+            os._exit(0)
+        else:
+            conn.close()

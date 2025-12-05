@@ -7,6 +7,28 @@ from Crypto.Cipher import PKCS1_OAEP
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
+AES_BLOCK = AES.block_size
+FRAME_LEN_BYTES = 8
+
+def recv_all(conn, n):
+    data = b""
+    while len(data) < n:
+        pkt = conn.recv(n - len(data))
+        if not pkt:
+            return None
+        data += pkt
+    return data
+
+def send_framed(conn, data_bytes):
+    ln = len(data_bytes)
+    conn.sendall(ln.to_bytes(FRAME_LEN_BYTES, "big") + data_bytes)
+
+def recv_framed(conn):
+    header = recv_all(conn, FRAME_LEN_BYTES)
+    if not header:
+        return None
+    ln = int.from_bytes(header, "big")
+    return recv_all(conn, ln)
 
 def load_keys(username):
     keys = {}
@@ -34,8 +56,8 @@ def main():
     client_socket.sendall(encrypted)
     response = client_socket.recv(4096)
 
-    if response == b"Invalid username or password.":
-        print("Terminating.")
+    if response == b"Invalid username or password":
+        print("Invalid username or password.\nTerminating.")
         client_socket.close()
         return
     
@@ -43,8 +65,8 @@ def main():
     sym_key = private_cipher.decrypt(response)
     aes = AES.new(sym_key, AES.MODE_ECB)
     ok_msg = aes.encrypt(pad(b"OK", AES.block_size))
-    client_socket.sendall(ok_msg)
-    client_socket.close()
+    send_framed(client_socket, aes.encrypt(ok_msg))
+
 
 if __name__ == "__main__":
     main()
