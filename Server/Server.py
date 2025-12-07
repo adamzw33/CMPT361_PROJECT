@@ -10,25 +10,18 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
 PORT = 13000
-DB_PATH = "user_pass.json" 
+DB_PATH = "user_pass.json"
 AES_BLOCK = AES.block_size
 FRAME_LEN_BYTES = 8
 
-try:
-    with open(DB_PATH, "r", encoding="utf-8") as f:
-        database = json.load(f)
-        if not isinstance(database, dict):
-            database = {}
-except (FileNotFoundError, json.JSONDecodeError):
-    database = {}
-
+# --- framing helpers (used after AES key exchange) ---
 def recv_all(conn, n):
     data = b""
     while len(data) < n:
-        pkt = conn.recv(n - len(data))
-        if not pkt:
+        part = conn.recv(n - len(data))
+        if not part:
             return None
-        data += pkt
+        data += part
     return data
 
 def send_framed(conn, data_bytes):
@@ -42,6 +35,7 @@ def recv_framed(conn):
     ln = int.from_bytes(header, "big")
     return recv_all(conn, ln)
 
+# --- load server and clients public keys ---
 def load_keys():
     keys = {}
     with open("server_private.pem", "rb") as f:
@@ -50,12 +44,16 @@ def load_keys():
         keys["server_public"] = RSA.import_key(f.read())
     for i in range(1, 6):
         name = f"client{i}"
-        with open(f"{name}_public.pem", "rb") as f:
-            keys[f"{name}_public"] = RSA.import_key(f.read())
+        try:
+            with open(f"{name}_public.pem", "rb") as f:
+                keys[f"{name}_public"] = RSA.import_key(f.read())
+        except FileNotFoundError:
+            # If a client's public key is missing, skip it.
+            pass
     return keys
 
 def load_user_password():
-    with open(DB_PATH, "r") as f:
+    with open(DB_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def ensure_client_folder(username):
@@ -68,52 +66,221 @@ def encrypt_aes(aes, plaintext):
 def decrypt_aes(aes, ciphertext):
     return unpad(aes.decrypt(ciphertext), AES_BLOCK)
 
-def handle_client(conn, addr, keys, user_pass):
-    private_cipher = PKCS1_OAEP.new(keys['server_private'])
-
-    encrypted_data = conn.recv(4096)
-    if not encrypted_data:
-        conn.close()
-        return
-    
+# --- save incoming email according to spec ---
+def handle_send_email(parsed_msg, src_username):
+    lines = parsed_msg.splitlines()
+    header_map = {}
+    content_index = None
+    for i, line in enumerate(lines):
+        if line.startswith("From:"):
+            header_map["From"] = line[len("From:"):].strip()
+        elif line.startswith("To:"):
+            header_map["To"] = line[len("To:"):].strip()
+        elif line.startswith("Title:"):
+            header_map["Title"] = line[len("Title:"):].strip()
+        elif line.startswith("Content Length:"):
+            header_map["Content Length"] = line[len("Content Length:"):].strip()
+        elif line == "Content:":
+            content_index = i + 1
+            break
+    content = "\n".join(lines[content_index:]) if content_index is not None else ""
     try:
-        decrypted = private_cipher.decrypt(encrypted_data).decode()
-        username, password = decrypted.split(';')
+        clen = int(header_map.get("Content Length", str(len(content))))
     except:
-        conn.sendall(b"Invalid username or password.")
-        conn.close()
+        return False, "Invalid Content Length"
+    if len(header_map.get("Title", "")) > 100:
+        return False, "Title too long"
+    if clen != len(content):
+        return False, "Content length mismatch"
+    if len(content) > 1000000:
+        return False, "Content too large"
+
+    dests = header_map.get("To", "")
+    dest_list = [d.strip() for d in dests.split(";") if d.strip()]
+    timestamp = datetime.datetime.now().isoformat()
+    filename_title = header_map.get("Title", "").replace(" ", "_") or "untitled"
+    saved_files = []
+    for dest in dest_list:
+        ensure_client_folder(dest)
+        fname = f"{src_username}_{filename_title}.txt"
+        fpath = os.path.join(dest, fname)
+        with open(fpath, "w", encoding="utf-8") as fh:
+            fh.write(f"From: {src_username}\n")
+            fh.write(f"To: {dests}\n")
+            fh.write(f"Time and Date: {timestamp}\n")
+            fh.write(f"Title: {header_map.get('Title','')}\n")
+            fh.write(f"Content Length: {clen}\n")
+            fh.write("Content:\n")
+            fh.write(content)
+        saved_files.append(fpath)
+    return True, (dest_list, clen, timestamp)
+
+def build_inbox_list(username):
+    ensure_client_folder(username)
+    files = glob.glob(os.path.join(username, "*.txt"))
+    entries = []
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+            from_line = next((l for l in lines if l.startswith("From:")), "").strip()
+            time_line = next((l for l in lines if l.startswith("Time and Date:")), "").strip()
+            title_line = next((l for l in lines if l.startswith("Title:")), "").strip()
+            sender = from_line[len("From:"):].strip()
+            tstamp = time_line[len("Time and Date:"):].strip()
+            title = title_line[len("Title:"):].strip()
+            entries.append((fpath, sender, tstamp, title))
+        except:
+            continue
+    entries.sort(key=lambda e: e[2], reverse=True)
+    return entries
+
+# --- per-client protocol handler ---
+def handle_client(conn, addr, keys, user_pass):
+    private_cipher = PKCS1_OAEP.new(keys["server_private"])
+    server_key_size_bytes = keys["server_private"].size_in_bytes()
+
+    try:
+        # Receive exact RSA block for credentials
+        encrypted_data = recv_all(conn, server_key_size_bytes)
+        if not encrypted_data or len(encrypted_data) != server_key_size_bytes:
+            conn.close()
+            return
+
+        try:
+            decrypted = private_cipher.decrypt(encrypted_data).decode()
+            username, password = decrypted.split(";")
+        except Exception:
+            conn.sendall(b"Invalid username or password")
+            conn.close()
+            return
+
+        if username not in user_pass or user_pass[username] != password:
+            conn.sendall(b"Invalid username or password")
+            print("The received client information:", username, "is invalid (Connection Terminated).")
+            conn.close()
+            return
+
+        # valid client
+        print("Connection Accepted and Symmetric Key Generated for client:", username)
+
+        key_label = f"{username}_public"
+        if key_label not in keys:
+            # missing client public key on server
+            conn.sendall(b"Invalid username or password")
+            print("Missing public key for", username)
+            conn.close()
+            return
+
+        client_pub = keys[key_label]
+        pub_cipher = PKCS1_OAEP.new(client_pub)
+
+        sym_key = os.urandom(32)
+        encrypted_sym = pub_cipher.encrypt(sym_key)
+        # send fixed-size RSA ciphertext (no framing)
+        conn.sendall(encrypted_sym)
+
+        aes = AES.new(sym_key, AES.MODE_ECB)
+
+        # framed OK from client (AES encrypted)
+        framed = recv_framed(conn)
+        if framed is None:
+            conn.close()
+            return
+        try:
+            ok = decrypt_aes(aes, framed)
+        except Exception:
+            conn.close()
+            return
+        if ok != b"OK":
+            conn.close()
+            return
+
+        # Enter encrypted menu loop
+        last_list = []
+        while True:
+            menu = ("Select the operation:\n\n1) Create and send an email\n\n2) Display the inbox list\n\n3) Display the email contents\n\n4) Terminate the connection\n\nchoice: ")
+            send_framed(conn, encrypt_aes(aes, menu.encode()))
+
+            framed_choice = recv_framed(conn)
+            if framed_choice is None:
+                break
+            try:
+                choice = decrypt_aes(aes, framed_choice).decode().strip()
+            except:
+                break
+
+            if choice == "1":
+                send_framed(conn, encrypt_aes(aes, b"Send the email"))
+                framed_email = recv_framed(conn)
+                if framed_email is None:
+                    break
+                try:
+                    email_text = decrypt_aes(aes, framed_email).decode()
+                except:
+                    break
+                ok, info = handle_send_email(email_text, username)
+                if not ok:
+                    err = f"ERROR: {info}"
+                    send_framed(conn, encrypt_aes(aes, err.encode()))
+                else:
+                    dest_list, clen, timestamp = info
+                    dests_str = ";".join(dest_list)
+                    print(f"An email from {username} is sent to {dests_str} has a content length of {clen}.")
+                    send_framed(conn, encrypt_aes(aes, b"Message stored"))
+                continue
+
+            elif choice == "2":
+                entries = build_inbox_list(username)
+                last_list = entries
+                lines = []
+                lines.append("Index\tFrom\tDateTime\tTitle")
+                for idx, ent in enumerate(entries, start=1):
+                    _, sender, tstamp, title = ent
+                    lines.append(f"{idx}\t{sender}\t{tstamp}\t{title}")
+                payload = "\n".join(lines)
+                send_framed(conn, encrypt_aes(aes, payload.encode()))
+                framed_ok = recv_framed(conn)
+                if framed_ok is None:
+                    break
+                try:
+                    _ = decrypt_aes(aes, framed_ok)
+                except:
+                    break
+                continue
+
+            elif choice == "3":
+                send_framed(conn, encrypt_aes(aes, b"the server request email index"))
+                framed_idx = recv_framed(conn)
+                if framed_idx is None:
+                    break
+                try:
+                    idx_bytes = decrypt_aes(aes, framed_idx)
+                    index = int(idx_bytes.decode().strip())
+                except:
+                    break
+                if not last_list or index < 1 or index > len(last_list):
+                    send_framed(conn, encrypt_aes(aes, b"Invalid index"))
+                    continue
+                fpath, sender, tstamp, title = last_list[index - 1]
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                send_framed(conn, encrypt_aes(aes, content.encode()))
+                continue
+
+            else:
+                print(f"Terminating connection with {username}")
+                conn.close()
+                return
+
+    except Exception:
+        try:
+            conn.close()
+        except:
+            pass
         return
-    if username not in user_pass or user_pass[username] != password:
-        conn.sendall(b"Invalid username or password.")
-        print("The receives client information:", username, "is invalid (Connection Terminated).")
-        conn.close()
-        return
-    
-    print("Connection Accepted and Symmetric key Generated for client:", username)
-    
-    client_pub = keys[f"{username}_public"]
-    pub_cipher = PKCS1_OAEP.new(client_pub)
-
-    sym_key = os.urandom(32)
-
-    encrypted_sym = pub_cipher.encrypt(sym_key)
-    conn.sendall(encrypted_sym)
-
-    from Crypto.Cipher import AES
-    aes = AES.new(sym_key, AES.MODE_ECB)
-    enc_ok = conn.recv(4096)
-    ok = unpad(aes.decrypt(enc_ok), 16)
-
-    if ok != b"OK":
-        conn.close()
-        return
-
-    conn.close()
-
 
 def main():
-
-    # Create the server socket (IPv4, TCP)
     try:
         serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         serverSocket.bind(('', PORT))
@@ -121,16 +288,21 @@ def main():
     except Exception as e:
         print("Server socket error:", e)
         sys.exit(1)
-    
+
     keys = load_keys()
     user_pass = load_user_password()
+
+    print("The server is ready to accept connections")
 
     while True:
         conn, addr = serverSocket.accept()
         pid = os.fork()
         if pid == 0:
-            serverSocket.close
+            serverSocket.close()
             handle_client(conn, addr, keys, user_pass)
             os._exit(0)
         else:
             conn.close()
+
+if __name__ == "__main__":
+    main()
